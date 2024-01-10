@@ -1,0 +1,785 @@
+---
+title: "MY472_Summative"
+author: '202333661'
+date: "2024-01-09"
+leafletmap: true
+always_allow_html: true
+output: 
+  html_document:
+    df_print: paged
+---
+Github: [here](https://github.com/yywengy/MY472--final.git)
+
+```{r setup, include=FALSE} 
+
+
+knitr::opts_chunk$set(echo = FALSE) 
+```
+
+```{r, read the package, message=FALSE}
+# read the package 
+library(httr)
+library(readxl)
+library(DBI)
+library(stringr)
+library(rvest)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(tmap)
+library(leaflet)
+library(leaflet.minicharts)
+library(RColorBrewer)
+library(purrr)
+library(ggplot2)
+library(biscale)
+library(cowplot)
+library(ggrepel)
+```
+
+### Introduction
+
+In the United Kingdom, the police have the authority to stop and search individuals based on “reasonable grounds”. The fairness of the process is not fully guaranteed. The project will identify possible biases in the stop-and-search process by analyzing relevant data in 2022 using graphs and maps. 
+
+```{r, sql,include = FALSE}
+# create the database 
+db_connection <- dbConnect(RSQLite::SQLite(), "finalsummative-db.sqlite") 
+
+# check if the database file exists
+if (file.exists("finalsummative-db.sqlite")) {
+  print("SQLite database exists")
+} else {
+  print("SQLite database does not exist")
+}
+```
+
+```{r, check function}
+# check function
+check_function <- function(dbname, dbtable) {
+  db_connection <- dbConnect(RSQLite::SQLite(), dbname = dbname)
+  if (dbExistsTable(db_connection, dbtable)) {
+  # the names of the columns
+  name_column <- dbListFields(db_connection, dbtable)
+  dbDisconnect(db_connection)
+  return(column_names = name_column)
+  } else {
+    dbDisconnect(db_connection)
+    return(list(status = "the table does not exist"))
+  }
+}
+```
+
+### Data
+
+Data used in this project were taken from the official UK police website, the Office for National Statistics, and Wikipedia. The official websites and government agencies have a high degree of credibility and accuracy. Wikipedia is an open editing platform that is not as accurate as the former two, but it provides a wide range of data resources. I acquired the data through the API, direct file downloads, and web scraping, respectively. In addition, I store the data in a SQL database and use SQL for dataset extraction and manipulation. The main calculation used in this project is the stop and search rate, which is calculated as the number of people from a particular group stopped and searched per 1,000 people from the same group.
+
+
+```{r, force names}
+# download the dataset 
+force_url <- "https://data.police.uk/api/forces"
+r_force <- GET(force_url)
+json_content_force <- content(r_force, "parsed")
+
+# find the force name 
+force_names <- unlist(lapply(json_content_force, function(x) x$id))
+  
+# find the data for each forces 
+stop_base_url <- "https://data.police.uk/api/stops-force"
+```
+
+
+```{r stop and search data for 2022, include = FALSE, cache = TRUE}
+# load the data for the 2022
+stop_data_month <- function(force_names, stop_base_url, month) {
+  stop_data_month <- data.frame(force_name = character(), date = character(), longitude = character(), latitude = character(),
+                                gender = character(), age_range = character())
+  for (force_name in force_names) {
+  current_force_url <- httr::modify_url(stop_base_url, query = list(force = force_name, date = paste("2022-", month, sep = "")))
+  
+  # Parse the JSON content
+  json_content_stop <- content(GET(current_force_url), "parsed")
+  
+  # find the date 
+  date <- unlist(lapply(json_content_stop, function(x) ifelse(is.null(x$datetime), NA, x$datetime))) %>%
+  substr(1, 7) 
+  
+  # find the ethnicity
+  ethnicity <- unlist(lapply(json_content_stop, function(x) ifelse(is.null(x$officer_defined_ethnicity), NA,
+                                                                     x$officer_defined_ethnicity)))
+  # find the longitude 
+  longitude <- unlist(lapply(json_content_stop, function(x) ifelse(is.null(x$location$longitude), NA,
+                                                                     x$location$longitude)))
+    
+  # find the latitude 
+  latitude <- unlist(lapply(json_content_stop, function(x) ifelse(is.null(x$location$latitude), NA,
+                                                                     x$location$latitude)))
+  # find the gender
+  gender <- unlist(lapply(json_content_stop, function(x) ifelse(is.null(x$gender), NA, x$gender)))
+  
+  # find the age
+  age_range <- unlist(lapply(json_content_stop, function(x) ifelse(is.null(x$age_range), NA,
+                                                                     x$age_range)))
+
+
+  # Create a data frame for the current force
+  force_data_2022 <- data.frame(
+    force_name = rep(force_name, length(json_content_stop)),
+    date = date,
+    ethnicity = ethnicity,
+    longitude = longitude,
+    latitude = latitude,
+    age_range = age_range,
+    gender = gender,
+    stringsAsFactors = FALSE
+  )
+   stop_data_month<- bind_rows(stop_data_month, force_data_2022)
+  }
+  return(stop_data_month)
+}
+
+# stop data for the last three years
+months <- sprintf("%02d", 12:1)
+stop_data_2022 <- data.frame() 
+for (month in months) {
+  stop_data_2022 <- dplyr::bind_rows(stop_data_2022, stop_data_month(force_names, stop_base_url, month))
+}
+
+# write the table to our database
+dbWriteTable(db_connection, name = "stop_data_2022", value = stop_data_2022,overwrite = TRUE)
+check_function("finalsummative-db.sqlite", "stop_data_2022")
+```
+
+```{r, ethnicity information for UK, include = FALSE}
+# download the ethnicity information for UK
+# URL to the Excel file
+ethnicity_url <- "https://www.ons.gov.uk/visualisations/dvc2203/groupedbarchart/datadownload.xlsx"
+
+# create a temporary file
+ethnicity_file <- tempfile(fileext = ".xlsx")
+
+# download the Excel file
+download.file(ethnicity_url, destfile = ethnicity_file, mode = "wb")
+
+# read the excel file, skip rows, and set the first row as column names
+ethnicity_data <- read_excel(ethnicity_file, skip = 8) %>%
+  setNames(gsub("\r\n", "", colnames(.)))
+
+# keep only the first and third columns and from 1 to 5 rows 
+ethnicity_data <- ethnicity_data[1:5, c(1, 3)] 
+
+# change the variable name 
+ethnicity_data_adjust <- ethnicity_data %>%
+  mutate(
+      `Ethnic Group` = case_when(
+      `Ethnic Group` == "Asian, Asian British or Asian Welsh" ~ "Asian",
+      `Ethnic Group` == "Black, Black British, Black Welsh, Caribbean or African" ~ "Black",
+      `Ethnic Group` == "Mixed or Multiple ethnic groups" ~ "Mixed",
+      `Ethnic Group` == "Other ethnic group" ~ "Other",
+      TRUE ~ `Ethnic Group`)) %>%
+  rename(ethnicity = `Ethnic Group`, numbers = '2021(number)') 
+
+ethnicity_number <- ethnicity_data_adjust
+
+# close and remove the temporary file
+unlink(ethnicity_file)
+
+# write the table to our database
+dbWriteTable(db_connection, name = "ethnicity_number", value = ethnicity_number,overwrite = TRUE)
+check_function("finalsummative-db.sqlite", "ethnicity_number")
+```
+
+```{r,UK shapefile, include=FALSE}
+# Download a Police Force Areas in England and Wales shapefile from the United Kindom Government website:
+file_name_PFA <- "PFA_Dec_2016_GCB_in_England_and_Wales_2022_-7983215496307552877.zip"
+file_path_PFA <- "data/"
+
+unzip(paste0(file_path_PFA, file_name_PFA),exdir=paste0(file_path_PFA,"shapefiles"))
+shp <- st_read("data/shapefiles/PFA_Dec_2016_GCB_in_England_and_Wales.shp")
+```
+
+### Analysis
+```{r, ethnicity stop per 1000,include = FALSE}
+# check the tables
+dbListTables(db_connection)
+stop_data_2022 <- dbReadTable(db_connection, "stop_data_2022")
+# Calculation of the number of stops per ethnic group per month
+# Calculation of the number of srios per 1000 of a specific group (here, by ethnicity)
+stop_per_1000 <- dbGetQuery(db_connection,
+  "WITH Ethnicity_counts AS (
+    SELECT s.ethnicity,
+    SUBSTR(date, -2) AS month,
+    COUNT(*) AS stop_count
+    FROM
+      stop_data_2022 s
+    GROUP BY
+      s.ethnicity,month)
+  SELECT
+    s.ethnicity,
+    SUM(s.stop_count) AS total_stop_count,
+    (SUM(s.stop_count)) / n.numbers * 1000 AS stops_per_1000,
+    month
+  FROM
+    Ethnicity_counts s
+  JOIN
+    ethnicity_number n ON s.ethnicity = n.ethnicity
+  GROUP BY
+    s.ethnicity, n.numbers,month")
+```
+
+The following chart analyzes the number of stops per 1,000 people of different races per month, and different colors represent each race.
+
+
+```{r, ethnicity by month graph, warning = FALSE}
+ggplot(stop_per_1000, aes(x = month, y = stops_per_1000, group = ethnicity, color = ethnicity)) +
+  geom_line(size = 1.5) +
+  geom_point(size = 3, aes(shape = ethnicity)) +
+  # Setting the color mapping
+  scale_color_manual(values=c("#CC6666", "#9999CC","#FF6629","#B1FF29","#FFA6AC")) +
+  # Set the range of the vertical axis, set the scale of the vertical axis
+  scale_y_continuous(expand = c(0, 0),
+    limits = c(min = 0, max = 5),
+    breaks = seq(0, 5, by = 0.5)) +
+  theme_minimal() +
+  labs(title = "Monthly Stop and Search Rate per 1000 People, by Ethnicity",
+       subtitle = "Source: UK Police Data",
+       x = "Month",
+       y = "Numbers") +
+  # Setting the Chart theme
+  theme(panel.grid.major.x = element_blank(),       # remove vertical line of the background
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),  
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(vjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(face = "bold")) 
+```
+
+
+It is clear that there are significant differences in stop and search rates between ethnicities. Specifically, blacks have the highest stop and search rates in 2022, followed by Asians and other races. Whites and Mixed races have relatively low stop and search rates. It is worth noting that despite the sharp drop in stop rates in November 2022, blacks are still more likely to be stopped relative to other races. This provides the evidence of the existence of racial bias.
+
+
+```{r, stop and serch data by gender and age and ethnicity}
+# information on the number of stops by gender and ethnic group
+stop_data_2022_gender_ethnicity <- dbGetQuery(db_connection, 
+  "SELECT gender, 
+  ethnicity, 
+  COUNT(*) AS stop_count
+  FROM stop_data_2022
+  GROUP BY gender, ethnicity")
+
+# Data cleaning
+stop_data_2022_gender_ethnicity <- stop_data_2022_gender_ethnicity %>%
+  filter(!is.na(gender) & !(gender == "Other") & !is.na(ethnicity))
+
+# information on the number of stops by gender, ethnic group and age
+stop_data_2022_gender_ethnicity_age <- dbGetQuery(db_connection, 
+  "SELECT gender, 
+  ethnicity, 
+  age_range,
+  COUNT(*) AS stop_count
+  FROM stop_data_2022
+  GROUP BY gender, ethnicity, age_range")
+
+# Data cleaning
+stop_data_2022_gender_ethnicity_age <- stop_data_2022_gender_ethnicity_age %>%
+  filter(!is.na(gender) & !(gender == "Other") & !is.na(ethnicity) & !is.na(age_range))
+  
+```
+
+```{r UK gender and age data, include = FALSE}
+UK_gender_age_ethnicity <- read.csv("data/RM032-2021-1-filtered-2024-01-08T00_57_55Z.csv")
+UK_gender_age_ethnicity <- UK_gender_age_ethnicity %>%
+  select(Sex..2.categories.,Age..23.categories.,Observation, Ethnic.group..6.categories.) %>%
+  rename(gender = Sex..2.categories., age_category = Age..23.categories., observation = Observation, ethnicity = Ethnic.group..6.categories.) %>%
+  pivot_wider(names_from = age_category, values_from = observation) %>%
+  mutate("10-17" = rowSums(select(.,`Aged 10 to 14 years`:`Aged 16 to 17 years`), na.rm = TRUE),
+         "18-24" = rowSums(select(.,`Aged 10 to 14 years`:`Aged 20 to 24 years`), na.rm = TRUE),
+         "25-34" = rowSums(select(.,`Aged 25 to 29 years`:`Aged 30 to 34 years`), na.rm = TRUE),
+         "over 34" = rowSums(select(.,`Aged 35 to 39 years`:`Aged 85 years and over`), na.rm = TRUE),
+         "under 10" = rowSums(select(.,`Aged 2 years and under`:`Aged 8 to 9 years`), na.rm = TRUE)) %>%
+   mutate(
+    ethnicity = case_when(
+      ethnicity == "Asian, Asian British or Asian Welsh" ~ "Asian",
+      ethnicity == "Black, Black British, Black Welsh, Caribbean or African" ~ "Black",
+      ethnicity == "Mixed or Multiple ethnic groups" ~ "Mixed",
+      ethnicity == "Other ethnic group" ~ "Other",
+      TRUE ~ ethnicity)) %>%
+  select(gender, ethnicity, "10-17","18-24","25-34","over 34","under 10") %>%
+  pivot_longer(cols = c("10-17", "18-24", "25-34", "over 34", "under 10"), names_to = "total_age_range", values_to = "total_observation") %>%
+  filter(!(ethnicity == "Does not apply")) 
+
+# write the table to our database
+dbWriteTable(db_connection, name = "UK_gender_age_ethnicity", value = UK_gender_age_ethnicity,overwrite = TRUE)
+check_function("finalsummative-db.sqlite", "UK_gender_age_ethnicity")
+
+# ethnicity and gender 
+UK_gender_ethnicity <- dbGetQuery(db_connection,
+  "SELECT 
+  gender,
+  ethnicity,
+  SUM(total_observation) AS total_population
+FROM
+  UK_gender_age_ethnicity
+GROUP BY
+  gender, ethnicity")
+
+# ethnicity and gender  
+stop_data_2022_gender_ethnicity_total <- left_join(stop_data_2022_gender_ethnicity,
+  UK_gender_ethnicity,
+  by = c("gender" = "gender", "ethnicity" = "ethnicity")) %>%
+  mutate(stop_gender_ethnicity_per_1000 = 1000 * (stop_count/total_population))   
+
+# ethnicity and gender and ethnicity
+stop_data_2022_gender_ethnicit_age_total <- left_join(UK_gender_age_ethnicity,
+  stop_data_2022_gender_ethnicity_age,
+  by = c("gender" = "gender", "ethnicity" = "ethnicity", "total_age_range" = "age_range"))%>%
+  mutate(stop_gender_ethnicity_age_per_1000 = 1000 * (stop_count/total_observation))  %>%
+  filter(!is.na(stop_count))
+```
+
+The pyramid-shaped bar chart shows the comparison between males and females in the different ethnic groups involved in stop-and-search.
+
+```{r gender and ethnicity graph }
+# create the graph
+# the numbers distribution for one gender
+basic_p2 <-  ggplot(stop_data_2022_gender_ethnicity_total, 
+                     aes(x = ethnicity, 
+                         fill = gender, 
+                         y = ifelse(gender == "Male", -stop_gender_ethnicity_per_1000, stop_gender_ethnicity_per_1000))) + 
+geom_bar(stat = "identity")      # values as bar heights
+
+# prepare for the graph
+gender_colors <- brewer.pal(5, "Set2")[1:2]
+
+gender_ethnicity_pyramid <- basic_p2 +
+  scale_y_continuous(labels = abs, 
+                     # limits of the y-axis, y-axis spans both positive and negative 
+                    limits = max(stop_data_2022_gender_ethnicity_total$stop_gender_ethnicity_per_1000) * c(-1,1)) +  
+  coord_flip() +    # transposing the x and y axes
+  theme_minimal() +
+  labs(x = "Ethnicity", 
+       y = "Number", 
+       fill = "Gender", 
+       title = "Stop and Search Rate per 1000 People, by Ethnicity and Gender",
+       subtitle = "Source: UK Police Data, Office for National Statistics") +
+   theme(panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),  
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(vjust = 3, face = "bold"),
+    axis.text.y = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    axis.line = element_line(colour = "black")) +
+    scale_fill_manual(values = gender_colors) +
+    guides(fill = guide_legend(reverse = TRUE))   # reverse the legend 
+
+print(gender_ethnicity_pyramid)
+```
+
+From the graph, when race is not considered, the odds of being stop-and-search are higher per 1,000 males than per 1,000 females. Thus, we can conclude that there is a gender bias in police stopping people. When race is taken into account, we find that both males and females are more likely to be affected by stop-and-search in the black population. Black females, while more likely to be stopped compared to females of other races, the difference between them is not significant. Most significantly, the bar representing black males indicates a significantly higher likelihood of being stopped compared to males of other races.
+
+
+
+
+The pyramid-shaped bar graph below illustrates racial disparities in the likelihood of stop-and-search across different age groups and gender.
+
+
+
+```{r gender and ethnicity and age graph}
+df <- stop_data_2022_gender_ethnicit_age_total %>%
+  mutate(stop_gender_ethnicity_age_per_1000 = ifelse(gender == "Female", stop_gender_ethnicity_age_per_1000, stop_gender_ethnicity_age_per_1000*-1))
+
+df$gender <- factor(df$gender, levels = c("Male", "Female"))
+df$ethnicity <- factor(df$ethnicity, levels = c("Asian", "Black", "Mixed", "White", "Other"))
+
+ggplot(df) +
+  geom_col(aes(fill = interaction(gender, ethnicity, sep = "-"),  #Creating color mappings with gender and ethnicity as interactive variables
+               y = stop_gender_ethnicity_age_per_1000,
+               x = total_age_range), 
+           # Setting the position and spacing of the bars
+               position = position_dodge2(padding = 2.1, reverse = FALSE),width = 0.7)+   #  y-axis scale label to absolute and adjust the range of the axes
+  scale_y_continuous(labels = abs,
+                     expand = c(0, 0)) +
+  scale_fill_manual(values = c("forestgreen","chartreuse2","maroon4","lightpink1","chocolate3","darkgoldenrod1","dodgerblue","cadetblue2","lightslategrey","lightsteelblue1"),
+                    name = "")+  
+  coord_flip() +    # Flip Axis
+  facet_wrap(.~ gender,      # use gender to create a faceted drawing
+            scale = "free_x",
+            strip.position = "top") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        panel.spacing.x = unit(0, "pt"), 
+        strip.background = element_rect(colour = "black"),
+        axis.text.x = element_text(face = "bold"),
+        axis.text.y = element_text(face = "bold"),
+        axis.title = element_text(face = "bold"),
+        plot.title = element_text(face = "bold", vjust = 2, hjust = 0.6),
+        plot.subtitle = element_text(vjust = -1))+
+  # Setting the graph title, subtitle, x-axis labels, and y-axis labels
+  labs(title = "Stop and Search Rate per 1000 People, by Ethnicity, Age and Gender",
+       subtitle = "Source: UK Police Data, Office for National Statistics") +
+  xlab("Age Range") +
+  ylab("Number")
+```
+
+Excluding the under-10 age group, it is noteworthy that, across all other age groups, the rate of stop-and-search per 1,000 is much higher for blacks than for other races, regardless of gender. Furthermore, individuals in the 25-34 and 10-17 age groups exhibit the highest likelihood of being stopped and searched, with black males being the most likely to be stopped and searched.
+
+
+```{r, prepare map data, include = FALSE}
+# change the name in the shp
+shp2 <- shp %>%
+  mutate(pfa16nm = str_replace_all(pfa16nm, "Police|Constabulary|-", "") %>% 
+           trimws(),
+         pfa16nm = ifelse(tolower(pfa16nm) == "dyfedpowys", "dyfed powys", pfa16nm))
+
+stop_data_2022_revise <- stop_data_2022 %>%
+  mutate(force_name = str_replace_all(force_name, "-", " ") %>% 
+           trimws()) 
+
+shp_lower <- shp2 %>%
+  mutate(force_name_lower = tolower(pfa16nm)) %>%
+  filter(force_name_lower %in% stop_data_2022_revise$force_name)
+
+# join the data 
+stop_data_2022_plot <- shp_lower |>
+  left_join(
+    stop_data_2022_revise, 
+    by = join_by(force_name_lower == force_name)
+  ) %>%
+  select(-force_name_lower)  # Drop the temporary lowercase columns
+
+# calculate the stop and search number for each Police force area 
+stop_and_search_PFA <- stop_data_2022_plot %>%
+  group_by(pfa16nm) %>%
+  dplyr::summarise(number = n()) %>%
+  rename("PFA_name" = "pfa16nm")
+  
+# calculate the stop and search number by ethnicityfor each Police force area 
+stop_and_search_PFA_ethnic <- stop_data_2022_plot %>%
+  st_drop_geometry() %>%
+  group_by(pfa16nm, ethnicity) %>%
+  summarise(stop_number = n()) %>%
+  filter(!is.na(ethnicity))
+
+
+stop_and_search_PFA_ethnic_wider <- stop_and_search_PFA_ethnic %>%
+  pivot_wider(names_from = ethnicity, values_from = stop_number, values_fill = 0) %>%
+  rename("Asian_stop" = "Asian","Black_stop" = "Black", "Mixed_stop" = "Mixed", "Other_stop" = "Other", "White_stop" = "White") 
+```
+
+
+```{r population,include = FALSE}
+# find the population in each police force 
+url_PFA <- "https://en.wikipedia.org/wiki/List_of_police_forces_of_the_United_Kingdom"
+# retrieve the HTML content from the url
+PFA_html_content <- read_html(url_PFA) 
+
+# find the PFA in the table 
+PFA_wiki_table <- html_elements(PFA_html_content, css = ".wikitable")[[1]] %>% html_table(fill = TRUE)
+
+# select column
+PFA_table <- PFA_wiki_table %>%
+  rename(Region = `Country/Region`) %>%
+  rename(Budget = `Budget (millions)`) %>%
+  # only keep the force that used in the geometry dataset
+  mutate(Force_name = str_replace_all(Force, "Police|Constabulary", "") %>% trimws()) %>%
+  mutate(Budget = as.numeric(str_replace_all(Budget, "\\[\\d+\\]|£|,", ""))*1000000) %>%
+  filter(Force_name %in% stop_and_search_PFA$PFA_name | 
+         grepl("Hampshire|Metropolitan", Force_name))  %>%  
+  select(Force, Region,Budget) 
+  
+# store the force and region name 
+Force_name <- PFA_table$Force
+Region_name <- PFA_table$Region
+
+# create the helper function to clean the data
+helper_function <- function(x, labels, data) {
+  text <- data[labels==x]
+  # Remove superscripts and content added in parentheses
+ text <- text %>% str_replace_all("\\(.*\\)", "")   
+ text <- text %>% str_replace_all("\\[.*\\]", "")  
+ # Remove new line signs and replace them with ;
+ text <- text %>% str_replace_all("\n", "; ")
+ # Remove any resulting ; at the beginning of the string
+ text <- text %>% str_replace_all("^; ", "") 
+ # Remove commas
+ text <- text %>% str_replace_all(",", "") 
+}
+
+# select table information
+all_link_elements <- html_elements(PFA_html_content, css = "td a")
+# text content from the elements 
+all_link_texts <- all_link_elements %>% html_text()
+
+# the population in each police force area 
+for (Force in Force_name) {
+  # obtain relevant link element 
+  current_PFA_url <- all_link_elements[all_link_texts == Force][1] 
+  # Navigate to URL of current force
+  # get hyperlink
+  current_partial_url <- current_PFA_url %>% html_attr("href")    
+  current_url <- paste("https://en.wikipedia.org",  current_partial_url, sep = "")
+  current_html <- read_html(current_url)
+  # get labels and data
+  labels <- current_html %>% html_elements(css = ".infobox-label") %>% html_text()
+  data <- current_html %>% html_elements(css = ".infobox-data") %>% html_text()
+  # Assign the population data to the force_table
+  PFA_table[PFA_table$Force == Force, "population"] <- helper_function("Population",labels,data)
+}
+
+# the population for the PFA: city of London Police 
+url_cityoflondon <- "https://en.wikipedia.org/wiki/City_of_London_Police"
+html_content <- read_html(url_cityoflondon)
+population_cityoflondon <- html_content %>%
+  html_nodes(css = '#mw-content-text div.mw-content-ltr.mw-parser-output table:nth-child(5) tbody tr:nth-child(11) td div ul') %>%
+  html_text() %>%
+  str_replace_all(",|\\[\\d+\\]|\\(|\\)", "") %>%
+  str_extract_all("\\d+") %>%   # only keep the number 
+  unlist() %>%    
+  as.numeric() %>%
+  sum()      
+
+# Find the ethnicity information for each region 
+# Function to scrape ethnic data
+ethnicity_data <- function(url) {
+  html_content <- read_html(url)
+  # get labels and data
+  labels <- html_content %>% html_elements(css = ".infobox-label") %>% html_text()
+  data <- html_content %>% html_elements(css = ".infobox-data") %>% html_text()
+  
+  # Extracting ethnicity data
+  if (any(str_detect(labels, regex("Ethnic", ignore_case = TRUE)))) {
+    # For regions where "Ethnic" label is present
+    ethnicity_data <- data[str_detect(labels, regex("Ethnic", ignore_case = TRUE))] %>%
+      str_replace_all("\\([^\\)]+\\)", "") %>%
+      str_extract_all("\\d+\\.?\\d+?%\\s?[A-Za-z]+") %>%
+      unlist()
+  } else {
+    # For regions like Wales and Greater London
+    ethnicity_data <- data %>%
+      str_extract_all("\\d+\\.?\\d+?%\\s?[A-Za-z]+") %>%
+      unlist()
+  }
+  return(ethnicity_data)
+}
+
+# Loop through each region
+for (current_Region in Region_name) {
+  # obtain relevant link element 
+  current_region_url <- all_link_elements[all_link_texts == current_Region][1]
+  ## Navigate to URL of current force
+  # get hyperlink
+  current_partial_url <- current_region_url %>% html_attr("href")    
+  current_url <- paste("https://en.wikipedia.org", current_partial_url, sep = "")
+  current_html <- read_html(current_url)
+  
+  # Scrape ethnic data
+  current_ethnicity_data <- ethnicity_data(current_url)
+  
+  # Assign the Region data to the PFA_table
+  PFA_table[PFA_table$Region == current_Region, "White"] <- current_ethnicity_data[grep("White", current_ethnicity_data,ignore.case = TRUE)][1]
+  PFA_table[PFA_table$Region == current_Region, "Asian"] <- current_ethnicity_data[grep("Asian", current_ethnicity_data,ignore.case = TRUE)][1]
+  PFA_table[PFA_table$Region == current_Region, "Black"] <- current_ethnicity_data[grep("Black", current_ethnicity_data,ignore.case = TRUE)][1]
+  PFA_table[PFA_table$Region == current_Region, "Mixed"] <- current_ethnicity_data[grep("Mixed", current_ethnicity_data,ignore.case = TRUE)][1]
+  PFA_table[PFA_table$Region == current_Region, "other"] <- current_ethnicity_data[grep("other", current_ethnicity_data,ignore.case = TRUE)][1]
+}
+
+
+options(scipen = 999)
+# clean the table 
+PFA_table_renew <- PFA_table %>%
+  mutate(population = str_replace_all(tolower(population), "\\b(?:approx|over|residents)\\b", "") %>%
+           str_replace("^\\.", ""),
+         population = ifelse(Force == "City of London Police", population_cityoflondon, population),
+         population = ifelse(grepl("million", population),
+                             as.numeric(gsub("[^0-9.]", "", population)) * 1000000,as.numeric(population)),
+         budget_per = Budget / population %>% round(2)) %>%
+  mutate_at(vars(White, Asian, Black, Mixed, other), ~as.numeric(gsub("[A-Za-z%]", "", .)))
+
+# write the table to our database
+dbWriteTable(db_connection, name = "stop_ethnicity_budget_region", value = PFA_table_renew,overwrite = TRUE)
+check_function("finalsummative-db.sqlite", "stop_ethnicity_budget_region")
+```
+
+
+```{r,include = FALSE}
+# compute the ethnicity population
+ethnicity_population_force <- dbGetQuery(db_connection,
+  "SELECT Force,Region,population, budget_per,
+  SUM(White * population)/100 AS white_population,
+  SUM(Asian * population)/100 AS asian_population,
+  SUM(Black * population)/100 AS black_population,
+  SUM(Mixed * population)/100 AS mixed_population,
+  SUM(other * population)/100 AS other_population
+FROM
+  stop_ethnicity_budget_region
+GROUP BY
+  Force")
+
+# Partial string matching with graph datasets and joining data 
+ethnicity_population_force_plot <- stop_and_search_PFA %>%
+  mutate(matched_PFA_force = map(PFA_name, ~ethnicity_population_force %>%
+                                filter(str_detect(Force, .x)))) %>%
+  unnest(matched_PFA_force)
+
+
+# join the stop and search data 
+ethnicity_per1000_plot <- ethnicity_population_force_plot %>%
+  left_join(stop_and_search_PFA_ethnic_wider, by = c("PFA_name" = "pfa16nm")) %>%
+  mutate(White_per_1000 = White_stop/white_population*1000,
+         Black_per_1000 = Black_stop/black_population*1000,
+         Asian_per_1000 = Asian_stop/asian_population*1000,
+         Mixed_per_1000 = Mixed_stop/mixed_population*1000,
+         Other_per_1000 = Other_stop/other_population*1000,
+         stop_per_1000 = number / population *1000) %>%
+  select(PFA_name, geometry, stop_per_1000, White_per_1000,Black_per_1000,Asian_per_1000,Mixed_per_1000,Other_per_1000, budget_per) 
+```
+
+Considering whether this bias varies geographically, the following map shows the odds of being stopped per 1,000 people living in different police force areas, with bars that take race into account attached to each police force area.
+
+```{r leaflet, warning=FALSE}
+# transform the data 
+ethnicity_per1000_plot_t <- ethnicity_per1000_plot %>%
+  st_transform(4326)
+
+shp_t <- shp %>% st_transform(4326)
+# find the centre point for each polygon- add the bar charts 
+ethnicity_per1000_plot_center = ethnicity_per1000_plot_t %>% 
+  st_point_on_surface() %>%    # Calculate the points on the surface of the polygon
+  st_coordinates() %>%        # Extract the coordinates of the point
+  as_tibble() %>% 
+  rename(lon = X, lat = Y) %>%
+  # Add the coordinate columns to the original data frame
+  bind_cols(ethnicity_per1000_plot_t %>% st_drop_geometry())
+
+# set the bar chart color palette
+bar_palette <- c("#3d85c6", "#f53288", "#fbbd3c", "#551935", "#559f4c")
+
+# set the map color palette
+map_palette <- colorNumeric(
+  palette = "Purples", 
+  domain = ethnicity_per1000_plot_t$stop_per_1000)
+
+# create the map 
+stop_and_search_map <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = shp_t, 
+              fillColor = "transparent",  # Set fill color to transparent
+              color = "black",            # Border color
+              weight = 2) %>%                # Border weight
+  addPolygons(data = ethnicity_per1000_plot_t , 
+              fillColor = ~map_palette(ethnicity_per1000_plot_t$stop_per_1000), 
+              fillOpacity = 1,       # adjust the transparency
+              weight = 1,            # adjust the polygon borders
+              smoothFactor = 1,      #smoothness of the polygon edges
+              label = ~paste("Force name: ", PFA_name),
+              labelOptions = labelOptions(noHide = F, direction = "top",
+                                          style = list("color" = "black","font-family" = "Gill Sans",  "font-size" =  "0.8rem", "border" = "0.3rem solid", "border-color" =
+                                                        "#9388ad"))) %>%       
+  # Add a color legend for the map
+  addLegend(pal = map_palette, 
+            values = ethnicity_per1000_plot_t$stop_per_1000, 
+            position = "bottomright", 
+            title = "Stop and Search <br />per 1000 people <br /> by PFA") %>%
+  # Add a small bar chart on the map
+  addMinicharts(lng = ethnicity_per1000_plot_center$lon, 
+                lat = ethnicity_per1000_plot_center$lat, 
+                type = "bar", 
+                # Chart data
+                chartdata = ethnicity_per1000_plot_center[, c("White_per_1000", "Black_per_1000","Asian_per_1000","Mixed_per_1000","Other_per_1000")],
+                colorPalette = bar_palette, width = 40, height = 65,
+                legend = FALSE) %>%
+  addLegend(position = "topright",
+  title = "Ethnicity", 
+  colors = bar_palette,  
+  opacity = 0.7,    # Setting the transparency of the legend
+  labels = c("White", "Black", "Asian", "Mixed", "Other"))
+
+stop_and_search_map
+```
+On the map, I approximate the racial proportions of each police force area within the region by the racial proportions of each region. 
+
+
+Merseyside Police and the Metropolitan Police are most likely to conduct searches, and both are more likely to stop and search black people than other races. It is worth noting that in Merseyside, other races and whites are stopped at roughly equal rates. By contrast, in the vast majority of areas, whites hardly experience similarly high stop rates. Under most PFAs, stop-and-search rates are typically highest for blacks. However, in the north of England, this bias has improved but does not mean it has disappeared completely.
+
+
+
+```{r economy and the ethnicity, include=FALSE}
+# Compare 
+ethnicity_per1000_compare <- ethnicity_per1000_plot %>%
+  mutate("black/white" = Black_per_1000/White_per_1000) %>%
+  mutate("asian/white" = Asian_per_1000/White_per_1000) %>%
+  mutate("mixed/white" = Mixed_per_1000/White_per_1000) %>%
+  mutate("other/white" = Other_per_1000/White_per_1000) %>%
+  select(PFA_name, "black/white", "asian/white", "mixed/white", "other/white", geometry, budget_per)
+
+# prepare the Bivariate data
+bivmap_data <- bi_class(ethnicity_per1000_compare, x = budget_per, y = `black/white`, style = "quantile", dim = 4)    # Specify bivariate categorization by quartiles, and specify the quartile dimension as 4
+bivmap_data <- st_transform(bivmap_data,st_crs(shp))
+
+# find the geometry center to add text
+centroids <- st_centroid(shp$geometry)
+# Extract the latitude and longitude information of the center point coordinates
+centroids <- st_coordinates(centroids)
+
+```
+
+
+The following bivariate map presents the relationship between the police force budget per capita and the multiples of stops per 1,000 blacks and stops per 1,000 whites.
+
+
+```{r economy and the ethnicity map, fig.height=6.5,fig.width=6 }
+# create the map
+bivmap <- ggplot() +
+  geom_sf(data = shp) +
+  geom_sf(data = bivmap_data, mapping = aes(fill = bi_class), color = "white", size = 0.1, show.legend = FALSE) +
+  # Adding a Fill Color
+  bi_scale_fill(pal = "BlueOr", dim = 4) +
+  labs(title = "Budget per Capita vs.\nBlack-to-White Stop-and-Search Ratios") +
+  bi_theme() +
+  # Adding the name for each police force 
+  geom_text_repel(
+    data = shp,
+    aes(x = centroids[, 1], y = centroids[, 2], label = pfa16nm), 
+    fontface = "bold",
+    size = 1.7,
+    box.padding = 0.0001)+
+  theme_minimal() +
+  theme(axis.title.x = element_blank(),  # remove x-axis label
+    axis.title.y = element_blank(),  
+    axis.text.x = element_blank(),       # remove x-axis ticks
+    axis.text.y = element_blank(),
+    panel.grid.major = element_blank(),  # remove grid lines
+    panel.grid.minor = element_blank(),  # remove grid lines
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5))
+
+# the lagend for the Bivariate map
+legend <- bi_legend(pal = "BlueOr",
+                    dim = 4,
+                    xlab = "Higher Budget per Capita",
+                    ylab = "Higher Ratio",
+                    size = 5.5)
+
+# add the legend to map
+budget_ratio_map <- ggdraw() +
+  draw_plot(bivmap, 0, 0, 1, 1) +  # Specify the location and size of the map 
+  draw_plot(legend, 0.2, .65, 0.2, 0.2)  
+
+print(budget_ratio_map)
+```
+
+
+It is clear that in most areas of the South of England, the lower per capita budgets of police forces are associated with relatively high multiples of black and white stops. Inadequate resources may lead to training and mental health challenges for the police, thus affecting their fairness in dealing with different races.
+
+
+Taking the data together, we can conclude that police officers are racial, age, gender, and geographically biased when stopping people. This project focuses more on racial bias and further substantiates this with the graphs.
+
+
+### Appendix: All code in this assignment
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+
